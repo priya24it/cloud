@@ -1,0 +1,259 @@
+import csv
+import tempfile
+from pathlib import Path
+
+import requests
+from google.cloud import storage
+
+from utils import BUCKET_MAPPING, logger
+
+
+class ReindexEntities(ReltioBase):
+    """Read one CSV from GCS and submit its entities for reindexing."""
+
+    def __init__(
+        self,
+        csv_file: str,
+        *,
+        entity_type: str,
+        reltio_col: str = "reltio_id",
+        delimiter: str = "|",
+    ):
+        super().__init__()
+
+        if not csv_file.strip():
+            raise ValueError("csv_file must not be empty.")
+
+        if not entity_type.strip():
+            raise ValueError("entity_type must not be empty.")
+
+        if len(delimiter) != 1:
+            raise ValueError("delimiter must be one character.")
+
+        self.entity_type = entity_type.strip()
+        self.reltio_col = reltio_col
+        self.delimiter = delimiter
+
+        # Automatically read the file and submit the request.
+        self.response = self.post_payload(csv_file.strip())
+
+    def read_gcs_entities(self, csv_file: str) -> list[str]:
+        bucket_name = BUCKET_MAPPING.get(self.project_id)
+
+        if not bucket_name:
+            raise ValueError(
+                f"No bucket configured for project {self.project_id}."
+            )
+
+        client = storage.Client(project=self.project_id)
+        blob = client.bucket(bucket_name).blob(csv_file)
+
+        entities = []
+
+        logger.info(f"Reading gs://{bucket_name}/{csv_file}")
+
+        # The local path is generated automatically.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_path = Path(temp_dir) / Path(csv_file).name
+
+            blob.download_to_filename(str(local_path), timeout=60)
+
+            with local_path.open(
+                "r",
+                newline="",
+                encoding="utf-8-sig",
+            ) as file:
+                reader = csv.DictReader(
+                    file,
+                    delimiter=self.delimiter,
+                )
+
+                if not reader.fieldnames:
+                    raise ValueError("CSV has no header row.")
+
+                if self.reltio_col not in reader.fieldnames:
+                    raise ValueError(
+                        f"Missing CSV column {self.reltio_col!r}. "
+                        f"Found: {reader.fieldnames}"
+                    )
+
+                for row_number, row in enumerate(reader, start=2):
+                    entity = (
+                        row.get(self.reltio_col) or ""
+                    ).strip()
+
+                    if not entity:
+                        logger.warning(
+                            f"Skipping row {row_number}: "
+                            "missing entity ID."
+                        )
+                        continue
+
+                    # Convert a bare ID into an entity URI.
+                    # Preserve values already starting with entities/.
+                    uri = (
+                        entity
+                        if entity.startswith("entities/")
+                        else f"entities/{entity}"
+                    )
+
+                    if (
+                        not uri.removeprefix("entities/")
+                        or uri.count("/") != 1
+                    ):
+                        raise ValueError(
+                            f"Invalid entity ID or URI "
+                            f"at CSV row {row_number}."
+                        )
+
+                    entities.append(uri)
+
+        if not entities:
+            raise ValueError(
+                "CSV contains no valid entities. "
+                "No request was sent."
+            )
+
+        return entities
+
+    def post_payload(self, csv_file: str) -> requests.Response:
+        # Read the CSV and build a Python list of entity URIs.
+        payload = self.read_gcs_entities(csv_file)
+
+        # Existing authentication sets self.base_headers.
+        self.authenticate_to_reltio_api()
+
+        # Construct the URL using ReltioBase configuration.
+        reindex_url = (
+            f"https://{self.tenant_name}.reltio.com"
+            f"/reltio/api/{self.tenant_id}/reindex"
+        )
+
+        logger.info(
+            f"Submitting {len(payload)} entities "
+            f"for entity type {self.entity_type}."
+        )
+
+        response = requests.post(
+            url=reindex_url,
+            params={
+                "tenantId": self.tenant_id,
+                "updateEntities": "true",
+                "entityType": self.entity_type,
+            },
+            headers=self.base_headers,
+            # Requests converts the Python list into JSON here.
+            json=payload,
+            timeout=60,
+        )
+
+        logger.info(
+            f"Reindex HTTP status: {response.status_code}"
+        )
+
+        response.raise_for_status()
+        return response
+
+
+
+import argparse
+import sys
+from datetime import UTC, datetime
+
+from reltio import ReindexEntities
+from utils import logger
+
+
+def parse_arguments(argv=None):
+    """Parse runtime arguments."""
+
+    def single_file(value):
+        value = value.strip()
+
+        if not value or "," in value:
+            raise argparse.ArgumentTypeError(
+                "Supply exactly one GCS object name."
+            )
+
+        return value
+
+    parser = argparse.ArgumentParser(
+        description="Cloud Run Job to Reindex Reltio Entities"
+    )
+
+    # First two arguments follow your existing structure.
+    parser.add_argument(
+        "-u",
+        "--workflow_uuid",
+        required=False,
+        help="Workflow UUID",
+    )
+
+    parser.add_argument(
+        "-p",
+        "--pipeline",
+        required=False,
+        help="Pipeline name",
+    )
+
+    parser.add_argument(
+        "-f",
+        "--file_to_process",
+        "--files_to_process",
+        dest="file_to_process",
+        required=True,
+        type=single_file,
+        help="One GCS object name, e.g. reltioID/entities.csv",
+    )
+
+    parser.add_argument(
+        "-e",
+        "--entity_type",
+        required=True,
+        help="Reltio entity type, e.g. FinancialAccount",
+    )
+
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    runtime_args = parse_arguments(argv)
+    start_time = datetime.now(UTC)
+
+    try:
+        logger.info(
+            f"Triggered with event: {vars(runtime_args)}"
+        )
+
+        # Pass the GCS object name directly.
+        # The class handles downloading, reading, and posting.
+        ops = ReindexEntities(
+            csv_file=runtime_args.file_to_process,
+            entity_type=runtime_args.entity_type,
+        )
+
+        # Do not call post_payload() again.
+        # It was already called by the constructor.
+        logger.info(
+            f"Reindex request submitted: "
+            f"HTTP {ops.response.status_code}"
+        )
+
+        elapsed = (
+            datetime.now(UTC) - start_time
+        ).total_seconds()
+
+        logger.info(
+            f"Job completed in {elapsed:.2f} seconds."
+        )
+
+        return 0
+
+    except Exception:
+        logger.exception("Reindex job failed.")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+
