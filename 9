@@ -1,0 +1,131 @@
+import argparse
+import sys
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+
+import google.auth
+
+from reltio import ReindexEntities
+from utils import BUCKET_MAPPING, ENV_MAPPING, download_file, logger
+
+
+def parse_arguments(argv=None):
+    """Parse runtime arguments."""
+
+    def single_file(value):
+        value = value.strip()
+
+        if not value or "," in value:
+            raise argparse.ArgumentTypeError(
+                "Supply exactly one GCS object name."
+            )
+
+        return value
+
+    parser = argparse.ArgumentParser(
+        description="Cloud Run Job to Reindex Reltio Entities"
+    )
+
+    # First two parameters match your existing structure.
+    parser.add_argument(
+        "-u",
+        "--workflow_uuid",
+        required=False,
+        help="Workflow UUID",
+    )
+
+    parser.add_argument(
+        "-p",
+        "--pipeline",
+        required=False,
+        help="Pipeline name",
+    )
+
+    parser.add_argument(
+        "-f",
+        "--file_to_process",
+        "--files_to_process",
+        dest="file_to_process",
+        required=True,
+        type=single_file,
+        help="Single GCS CSV object name, e.g. reltioID/entities.csv",
+    )
+
+    parser.add_argument(
+        "-e",
+        "--entity_type",
+        required=True,
+        help="Reltio entity type, e.g. FinancialAccount",
+    )
+
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    runtime_args = parse_arguments(argv)
+    start_time = datetime.now(UTC)
+
+    try:
+        # Used only to resolve the bucket and environment mappings.
+        _, project_id = google.auth.default()
+
+        if not project_id:
+            raise ValueError(
+                "No Google Cloud project detected through ADC."
+            )
+
+        env = ENV_MAPPING.get(project_id, "n/a")
+        bucket = BUCKET_MAPPING.get(project_id)
+
+        if not bucket:
+            raise ValueError(
+                f"No bucket configured for project ID {project_id}."
+            )
+
+        logger.info(
+            f"Executing Project ID: {project_id}, Environment: {env}"
+        )
+        logger.info(
+            f"Triggered with event: {vars(runtime_args)}"
+        )
+
+        object_name = runtime_args.file_to_process
+        logger.info(f"Processing gs://{bucket}/{object_name}")
+
+        # Generate a local directory automatically.
+        # Download and process before the directory is deleted.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_path = Path(temp_dir) / Path(object_name).name
+
+            download_file(
+                bucket,
+                object_name,
+                str(local_path),
+            )
+
+            ops = ReindexEntities(
+                csv_file=str(local_path),
+                entity_type=runtime_args.entity_type,
+            )
+
+            # Constructor already called post_payload().
+            logger.info(
+                f"Submitted {object_name}: "
+                f"HTTP {ops.response.status_code}"
+            )
+
+        elapsed = (datetime.now(UTC) - start_time).total_seconds()
+        logger.info(
+            f"Reindex submission completed in {elapsed:.2f} seconds."
+        )
+
+        return 0
+
+    except Exception:
+        logger.exception("Reindex job failed.")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
